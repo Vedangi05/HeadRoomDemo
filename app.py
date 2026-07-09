@@ -10,8 +10,21 @@ import headroom
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+def _get_gemini_api_key():
+    """Read the key from Streamlit secrets (cloud) or the environment (local)."""
+    try:
+        key = st.secrets["GEMINI_API_KEY"]
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY")
+
+
+GEMINI_API_KEY = _get_gemini_api_key()
+# Build the client lazily so a missing key shows a friendly error instead of
+# crashing the app at import time.
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 # A bulky, structured tool output (JSON log records) — the kind of context
