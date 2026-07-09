@@ -143,7 +143,7 @@ st.write(
 
 question = st.text_input(
     "Ask a question",
-    value="Which requests failed and what was the error?"
+    value="What is the capital of USA?"
 )
 
 profile = st.selectbox(
