@@ -4,27 +4,52 @@ import time
 from dotenv import load_dotenv
 
 import streamlit as st
-from google import genai
+from openai import OpenAI
 
 import headroom
 
 load_dotenv()
 
-def _get_gemini_api_key():
-    """Read the key from Streamlit secrets (cloud) or the environment (local)."""
+
+def _get_config(key, default=None):
+    """Read configuration from Streamlit secrets (cloud) or environment (local)."""
     try:
-        key = st.secrets["GEMINI_API_KEY"]
-        if key:
-            return key
+        if key in st.secrets and st.secrets[key]:
+            return st.secrets[key]
     except Exception:
         pass
-    return os.getenv("GEMINI_API_KEY")
+    return os.getenv(key, default)
 
 
-GEMINI_API_KEY = _get_gemini_api_key()
+OPENAI_API_KEY = _get_config("OPENAI_API_KEY")
+OPENAI_BASE_URL = _get_config("OPENAI_BASE_URL")
+OPENAI_MODEL = _get_config("OPENAI_MODEL", "llama-3.3-70b-instruct")
+
 # Build the client lazily so a missing key shows a friendly error instead of
 # crashing the app at import time.
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+openai_client = (
+    OpenAI(
+        api_key=OPENAI_API_KEY,
+        base_url=OPENAI_BASE_URL,
+    )
+    if OPENAI_API_KEY
+    else None
+)
+
+
+@st.cache_data(ttl=300)
+def fetch_available_models():
+    """Fetch models accessible by this API key from Navigator/LiteLLM."""
+    if not openai_client:
+        return []
+    try:
+        models = openai_client.models.list()
+        chat_keywords = ["instruct", "gpt", "claude", "llama", "mistral", "gemma", "nemotron", "granite"]
+        all_ids = [m.id for m in models.data]
+        chat_models = [m for m in all_ids if any(kw in m.lower() for kw in chat_keywords)]
+        return sorted(chat_models) if chat_models else sorted(all_ids)
+    except Exception:
+        return []
 
 
 # A bulky, structured tool output (JSON log records) — the kind of context
@@ -53,7 +78,7 @@ SAMPLE_CONTEXT = json.dumps(_SAMPLE_RECORDS, indent=2)
 
 def estimate_tokens(text):
     return max(1, len(text) // 4)
-    
+
 
 def headroom_compress_context(context, question, profile="agent-90"):
     """
@@ -72,10 +97,11 @@ def headroom_compress_context(context, question, profile="agent-90"):
         {"role": "user", "content": question},
     ]
 
+    # Use standard tokenizer profile for Headroom compression pipeline
     result = headroom.compress(
         messages,
-        model="gemini-2.5-flash",
-        model_limit=1_000_000,
+        model="gpt-4o",
+        model_limit=128_000,
         config=config,
     )
 
@@ -88,9 +114,8 @@ def headroom_compress_context(context, question, profile="agent-90"):
     return compressed_context, result
 
 
-def ask_gemini(question, context):
-    prompt = f"""
-You are a helpful assistant.
+def ask_llm(question, context, model_name="llama-3.3-70b-instruct"):
+    prompt = f"""You are a helpful assistant.
 
 Use the context below if it is relevant to the question.
 If the context does not contain the answer, answer using your own knowledge.
@@ -104,20 +129,22 @@ Question:
 
     start_time = time.time()
 
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+    response = openai_client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
     )
 
     latency = round(time.time() - start_time, 2)
-    answer = response.text
+    answer = response.choices[0].message.content
 
-    # Real token counts reported by the Gemini API.
-    usage = getattr(response, "usage_metadata", None)
+    # Real token counts reported by the API.
+    usage = getattr(response, "usage", None)
     tokens = {
-        "prompt": getattr(usage, "prompt_token_count", None),
-        "output": getattr(usage, "candidates_token_count", None),
-        "total": getattr(usage, "total_token_count", None),
+        "prompt": getattr(usage, "prompt_tokens", None),
+        "output": getattr(usage, "completion_tokens", None),
+        "total": getattr(usage, "total_tokens", None),
     }
 
     # Fall back to an estimate if the API did not return usage metadata.
@@ -137,7 +164,7 @@ st.set_page_config(
 st.title("LLM Answer: With vs Without Headroom")
 st.write(
     "Paste context, ask a question. The app compresses the context with the real "
-    "**headroom-ai** package, then calls Gemini twice — once with the full context "
+    "**headroom-ai** package, then calls your LLM twice — once with the full context "
     "and once with the Headroom-compressed context — and compares the real tokens used."
 )
 
@@ -146,12 +173,29 @@ question = st.text_input(
     value="What is the capital of USA?"
 )
 
-profile = st.selectbox(
-    "Headroom savings profile",
-    options=["agent-90", "balanced"],
-    index=0,
-    help="agent-90 targets ~90% savings (more aggressive); balanced targets ~70%.",
-)
+# Fetch accessible models from Navigator
+available_models = fetch_available_models()
+default_model = OPENAI_MODEL if (OPENAI_MODEL and OPENAI_MODEL != "gpt-4o") else "llama-3.3-70b-instruct"
+
+col_model, col_prof = st.columns(2)
+with col_model:
+    if available_models:
+        default_idx = available_models.index(default_model) if default_model in available_models else 0
+        selected_model = st.selectbox(
+            "LLM Model (Available on your API key)",
+            options=available_models,
+            index=default_idx,
+        )
+    else:
+        selected_model = st.text_input("LLM Model", value=default_model)
+
+with col_prof:
+    profile = st.selectbox(
+        "Headroom savings profile",
+        options=["agent-90", "balanced"],
+        index=0,
+        help="agent-90 targets ~90% savings (more aggressive); balanced targets ~70%.",
+    )
 
 context = st.text_area(
     "Context (the text Headroom compresses before the LLM call)",
@@ -160,8 +204,8 @@ context = st.text_area(
 )
 
 if st.button("Run Comparison"):
-    if not GEMINI_API_KEY:
-        st.error("GEMINI_API_KEY missing. Add it in your .env file.")
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "your_litellm_virtual_api_key_here":
+        st.error("OPENAI_API_KEY missing or placeholder detected. Please add your API key in your .env file.")
         st.stop()
 
     if not question.strip():
@@ -200,24 +244,28 @@ if st.button("Run Comparison"):
         st.markdown("### With Headroom (compressed context)")
         st.text_area("Compressed context", compressed_context, height=300)
 
-    st.subheader("Gemini Answer Comparison")
+    st.subheader(f"{selected_model} Answer Comparison")
 
-    with st.spinner("Calling Gemini without Headroom..."):
-        normal_answer, normal_latency, normal_tokens = ask_gemini(
-            question, full_context
-        )
+    try:
+        with st.spinner(f"Calling {selected_model} without Headroom..."):
+            normal_answer, normal_latency, normal_tokens = ask_llm(
+                question, full_context, model_name=selected_model
+            )
 
-    with st.spinner("Calling Gemini with Headroom..."):
-        compressed_answer, compressed_latency, compressed_tokens = ask_gemini(
-            question, compressed_context
-        )
+        with st.spinner(f"Calling {selected_model} with Headroom..."):
+            compressed_answer, compressed_latency, compressed_tokens = ask_llm(
+                question, compressed_context, model_name=selected_model
+            )
+    except Exception as e:
+        st.error(f"Error calling model '{selected_model}': {e}")
+        st.stop()
 
     # Token comparison based on real prompt tokens sent to the LLM.
     normal_prompt = normal_tokens["prompt"]
     compressed_prompt = compressed_tokens["prompt"]
-    reduction = round((1 - compressed_prompt / normal_prompt) * 100, 2)
+    reduction = round((1 - compressed_prompt / normal_prompt) * 100, 2) if normal_prompt else 0
 
-    st.subheader("Gemini Prompt Tokens (real usage, end to end)")
+    st.subheader(f"{selected_model} Prompt Tokens (real usage, end to end)")
     col1, col2, col3 = st.columns(3)
     col1.metric("Without Headroom — prompt tokens", normal_prompt)
     col2.metric("With Headroom — prompt tokens", compressed_prompt)
